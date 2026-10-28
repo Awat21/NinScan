@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <Version>0.1.0</Version>
+    <Authors>NinScan contributors</Authors>
+    <Product>NinScan</Product>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>

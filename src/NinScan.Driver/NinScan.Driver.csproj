@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>NinScan.Driver</RootNamespace>
+    <AssemblyName>NinScan.Driver</AssemblyName>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <ComVisible>false</ComVisible>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ASCOM.DeviceInterfaces" Version="7.1.2" />
+    <PackageReference Include="ASCOM.Com.Components" Version="4.0.0" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Install\*.cmd" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\NinScan.Core\NinScan.Core.csproj" />
+  </ItemGroup>
+</Project>
