@@ -31,7 +31,9 @@ These checks confirm the parts the simulator can't: motor directions, speeds and
 5. **Sync.** Plate-solve and sync in N.I.N.A., or centre the star by hand and sync. Do this at two or three stars in different parts of the sky. The settings window shows the model terms and fit.
 6. **Track** for ten minutes and watch for drift. Then send me the log for that period.
 7. **Freedom Find.** Push the tube a little by hand while tracking. The log should say "Tube moved … pushed by hand?" and tracking should carry on from the new spot. If the position doesn't change when you push, try setting Freedom Find encoders to **On**.
-8. **Park** puts the tube back at the start position (level, facing north), ready for next time.
+8. **Backlash.** Leave Backlash on "Learn from syncs". It learns from plate-solve syncs approached from both directions. With the default "tracking direction" approach that happens naturally: targets rising in the east and setting in the west load the altitude gears opposite ways. Watch the "Backlash and approach" section of the settings window fill in over a session or two. If you'd rather match the SynScan App, choose "Up and right".
+9. **Clutch slips.** If a sync shows the motors moved but the tube didn't, the log and the settings window say so. If the count keeps climbing, tighten the clutches a little or rebalance the tube.
+10. **Park** puts the tube back at the start position (level, facing north), ready for next time.
 
 If the mount stays switched on between sessions, NinScan remembers its position and the pointing model. After a power cycle it starts fresh from the start position.
 
@@ -41,3 +43,4 @@ If the mount stays switched on between sessions, NinScan remembers its position 
 - Whether either axis needed reversing.
 - Any "Mount rejected … error 2 (motor not stopped)" lines in the log. That would mean the board doesn't accept speed changes while running, and I'd change how tracking updates are sent.
 - How far off the first goto was, and how far off after one and after three syncs.
+- The learned backlash values after a session, and any clutch slip warnings.

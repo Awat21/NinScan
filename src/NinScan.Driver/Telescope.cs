@@ -73,7 +73,7 @@ namespace NinScan.Driver
             using (var f = new SetupForm()) f.ShowDialog();
         }
 
-        public ArrayList SupportedActions => new ArrayList { "NinScan:ModelInfo", "NinScan:ClearModel", "NinScan:Status" };
+        public ArrayList SupportedActions => new ArrayList { "NinScan:ModelInfo", "NinScan:ClearModel", "NinScan:Status", "NinScan:Mechanics" };
 
         public string Action(string actionName, string actionParameters)
         {
@@ -84,6 +84,13 @@ namespace NinScan.Driver
                 case "ninscan:clearmodel":
                     Engine.ClearModel();
                     return "cleared";
+                case "ninscan:mechanics":
+                {
+                    var m = Engine.Mechanics;
+                    return "backlash az " + (AstroMath.ToDeg(m.Effective(0)) * 60).ToString("F1") + "′ (" + m.TotalWeight(0) + " syncs), alt "
+                        + (AstroMath.ToDeg(m.Effective(1)) * 60).ToString("F1") + "′ (" + m.TotalWeight(1) + " syncs); slips az " + m.SlipEvents[0]
+                        + ", alt " + m.SlipEvents[1] + (Engine.LastSyncReport != null ? "; last sync: " + Engine.LastSyncReport : "");
+                }
                 case "ninscan:status":
                     return Engine.Connected
                         ? "mount " + Engine.MountPosition + "; sky " + Engine.SkyPosition + "; tracking " + Engine.Tracking + "; slewing " + Engine.Slewing

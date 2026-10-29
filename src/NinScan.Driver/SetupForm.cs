@@ -30,6 +30,12 @@ namespace NinScan.Driver
         private readonly TextBox _aperture = Num();
         private readonly TextBox _focal = Num();
         private readonly ComboBox _aux = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
+        private readonly ComboBox _backlash = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
+        private readonly TextBox _manualAz = Num();
+        private readonly TextBox _manualAlt = Num();
+        private readonly ComboBox _approach = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
+        private readonly TextBox _overshoot = Num();
+        private readonly Label _learned = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
         private readonly CheckBox _debug = new CheckBox { Text = "Log every serial command (for troubleshooting)", AutoSize = true };
         private readonly Label _modelInfo = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
         private readonly Label _status = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
@@ -76,6 +82,23 @@ namespace NinScan.Driver
             Row(grid, "Hand-push detection (°, 0 = off)", _manual);
             Row(grid, "Restart model if a sync is off by (°)", _resetModel);
             Row(grid, "Aperture / focal length (mm)", Flow(_aperture, _focal));
+
+            Heading(grid, "Backlash and approach");
+            _backlash.Items.AddRange(new object[] { "Learn from syncs", "Manual", "Off" });
+            Row(grid, "Backlash", _backlash);
+            Row(grid, "Manual backlash az / alt (′)", Flow(_manualAz, _manualAlt));
+            _approach.Items.AddRange(new object[] { "Tracking direction", "Up and right (SynScan)", "Down and left", "Off" });
+            Row(grid, "Goto final approach", _approach);
+            Row(grid, "Minimum approach overshoot (°)", _overshoot);
+            var resetLearned = new Button { Text = "Forget learned", AutoSize = true };
+            resetLearned.Click += (s, e) =>
+            {
+                if (MessageBox.Show(this, "Forget the learned backlash and slip counts? Do this after adjusting the clutches or gears.", "NinScan",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                SharedMount.Engine.ResetLearnedMechanics();
+                ShowLearned();
+            };
+            Row(grid, "", Flow(_learned, resetLearned));
 
             Heading(grid, "Pointing model");
             var clear = new Button { Text = "Clear model", AutoSize = true };
@@ -127,7 +150,13 @@ namespace NinScan.Driver
             _aperture.Text = F(_settings.ApertureMm);
             _focal.Text = F(_settings.FocalLengthMm);
             _debug.Checked = _settings.DebugLogging;
+            _backlash.SelectedIndex = (int)_settings.Backlash;
+            _manualAz.Text = F(_settings.ManualBacklashAzArcmin);
+            _manualAlt.Text = F(_settings.ManualBacklashAltArcmin);
+            _approach.SelectedIndex = (int)_settings.Approach;
+            _overshoot.Text = F(_settings.MinApproachOvershootDeg);
             ShowModel();
+            ShowLearned();
             var e = SharedMount.Engine;
             _status.Text = e.Connected
                 ? "Connected (" + e.ConnectionDescription + ", board " + e.BoardInfo?.VersionText + "). A new COM port takes effect on the next connect."
@@ -152,6 +181,20 @@ namespace NinScan.Driver
                     + "\n" + m.Terms;
         }
 
+        private void ShowLearned()
+        {
+            var e = SharedMount.Engine;
+            var m = e.Mechanics;
+            string Arcmin(double rad) => (AstroMath.ToDeg(rad) * 60).ToString("F1") + "′";
+            var text = m.TotalWeight(0) + m.TotalWeight(1) <= 0
+                ? "Nothing learned yet. Backlash is learned from syncs approached from both directions; it builds up over sessions."
+                : "Learned backlash: azimuth " + Arcmin(m.Effective(0)) + " (from " + m.TotalWeight(0) + " syncs), altitude "
+                    + Arcmin(m.Effective(1)) + " (from " + m.TotalWeight(1) + " syncs).";
+            text += "\nClutch slips seen: azimuth " + m.SlipEvents[0] + ", altitude " + m.SlipEvents[1] + ".";
+            if (!string.IsNullOrEmpty(e.LastSyncReport)) text += "\nLast sync: " + e.LastSyncReport;
+            _learned.Text = text;
+        }
+
         private void Save()
         {
             try
@@ -174,6 +217,11 @@ namespace NinScan.Driver
                 s.ApertureMm = P(_aperture, "aperture");
                 s.FocalLengthMm = P(_focal, "focal length");
                 s.DebugLogging = _debug.Checked;
+                s.Backlash = (BacklashMode)Math.Max(0, _backlash.SelectedIndex);
+                s.ManualBacklashAzArcmin = P(_manualAz, "manual azimuth backlash");
+                s.ManualBacklashAltArcmin = P(_manualAlt, "manual altitude backlash");
+                s.Approach = (ApproachMode)Math.Max(0, _approach.SelectedIndex);
+                s.MinApproachOvershootDeg = P(_overshoot, "approach overshoot");
                 if (string.IsNullOrEmpty(s.ComPort)) throw new ArgumentException("Choose a COM port, or SIMULATOR.");
                 SharedMount.SaveSettings(s);
                 DialogResult = DialogResult.OK;

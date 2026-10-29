@@ -59,6 +59,36 @@ namespace NinScan.Core.Simulation
             }
         }
 
+        /// <summary>Where the tube actually points, in steps. Differs from the motor count by the gear play and any slip.</summary>
+        public double TubePositionOf(Axis axis)
+        {
+            lock (_lock)
+            {
+                Advance();
+                return _axes[(int)axis].Tube;
+            }
+        }
+
+        /// <summary>Gear backlash (full play) of an axis, in steps. The tube only follows once the motor has taken it up.</summary>
+        public void SetBacklash(Axis axis, double steps)
+        {
+            lock (_lock)
+            {
+                Advance();
+                _axes[(int)axis].Backlash = steps;
+            }
+        }
+
+        /// <summary>Simulates a clutch slip: the tube ends up this many steps away from where the motors put it.</summary>
+        public void Slip(Axis axis, double steps)
+        {
+            lock (_lock)
+            {
+                Advance();
+                _axes[(int)axis].SlipOffset += steps;
+            }
+        }
+
         /// <summary>Simulates someone pushing the tube by hand (Freedom Find keeps the count).</summary>
         public void Push(Axis axis, double steps)
         {
@@ -137,7 +167,10 @@ namespace NinScan.Core.Simulation
                 case 'F': Initialised = true; return "=";
                 case 'E':
                     if (ax.Running) return "!2";
-                    ax.Position = MotorCodec.DecodePosition(data);
+                    // Setting the count does not move anything; keep the tube where it is relative to it.
+                    double shift = MotorCodec.DecodePosition(data) - ax.Position;
+                    ax.Position += shift;
+                    ax.SlipOffset += shift;
                     return "=";
                 case 'G':
                     if (ax.Running) return "!2";
@@ -194,6 +227,12 @@ namespace NinScan.Core.Simulation
             }
 
             public double Position;
+            /// <summary>Tube position in steps: the motor count less the gear play, plus any clutch slip.</summary>
+            public double Tube => Position - Play + SlipOffset;
+            /// <summary>Motor minus tube through the gears, between -Backlash/2 and +Backlash/2.</summary>
+            public double Play;
+            public double SlipOffset;
+            public double Backlash;
             public bool Running;
             public MotionMode Mode = MotionMode.SlewSlow;
             public bool Reverse;
@@ -287,6 +326,8 @@ namespace NinScan.Core.Simulation
                         }
                     }
                     Position += Reverse ? -move : move;
+                    double half = Backlash / 2;
+                    Play = Math.Max(-half, Math.Min(half, Play + (Reverse ? -move : move)));
 
                     if (_stopping && _speed <= 0)
                     {

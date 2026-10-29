@@ -5,6 +5,29 @@ using System.Runtime.Serialization.Json;
 
 namespace NinScan.Core.Mount
 {
+    public enum BacklashMode
+    {
+        /// <summary>Learn backlash from syncs and plate solves, and compensate for it.</summary>
+        Learn = 0,
+        /// <summary>Use the values typed into the settings.</summary>
+        Manual = 1,
+        /// <summary>No backlash compensation.</summary>
+        Off = 2,
+    }
+
+    /// <summary>Which way a goto makes its final move, so the gears always end up loaded the same way.</summary>
+    public enum ApproachMode
+    {
+        /// <summary>Finish moving the way tracking will continue, so tracking starts with the gears already loaded.</summary>
+        TrackingDirection = 0,
+        /// <summary>Always finish moving up and to the right (increasing altitude and azimuth), like the SynScan App.</summary>
+        UpAndRight = 1,
+        /// <summary>Always finish moving down and to the left.</summary>
+        DownAndLeft = 2,
+        /// <summary>Go straight to the target.</summary>
+        Off = 3,
+    }
+
     public enum AuxEncoderMode
     {
         /// <summary>Do not touch the board's Freedom Find setting.</summary>
@@ -69,6 +92,14 @@ namespace NinScan.Core.Mount
         /// </summary>
         [DataMember] public AuxEncoderMode AuxEncoders = AuxEncoderMode.LeaveAsIs;
 
+        [DataMember] public BacklashMode Backlash = BacklashMode.Learn;
+        /// <summary>Used when <see cref="Backlash"/> is Manual, arcminutes.</summary>
+        [DataMember] public double ManualBacklashAzArcmin = 0;
+        [DataMember] public double ManualBacklashAltArcmin = 0;
+        [DataMember] public ApproachMode Approach = ApproachMode.TrackingDirection;
+        /// <summary>Smallest overshoot before the final approach move, degrees. It grows to twice the backlash when that is larger.</summary>
+        [DataMember] public double MinApproachOvershootDeg = 1.0;
+
         /// <summary>Reported to clients only. Defaults are the Flextube 250P.</summary>
         [DataMember] public double ApertureMm = 254;
         [DataMember] public double FocalLengthMm = 1200;
@@ -111,6 +142,9 @@ namespace NinScan.Core.Mount
             if (AzimuthTravelDeg < 180) throw new ArgumentException("Azimuth travel must be at least 180 degrees either way, or some of the sky is unreachable.");
             if (TrackingIntervalMs < 100 || TrackingIntervalMs > 5000) throw new ArgumentException("Tracking interval must be 100–5000 ms.");
             if (MaxMoveRateDegPerSec <= 0) throw new ArgumentException("Maximum move rate must be positive.");
+            if (ManualBacklashAzArcmin < 0 || ManualBacklashAltArcmin < 0 || ManualBacklashAzArcmin > 54 || ManualBacklashAltArcmin > 54)
+                throw new ArgumentException("Manual backlash must be between 0 and 54 arcminutes.");
+            if (MinApproachOvershootDeg < 0 || MinApproachOvershootDeg > 5) throw new ArgumentException("Approach overshoot must be 0–5 degrees.");
         }
     }
 }

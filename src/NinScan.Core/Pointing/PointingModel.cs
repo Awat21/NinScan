@@ -14,9 +14,20 @@ namespace NinScan.Core.Pointing
     {
         [DataMember] public double SkyAz;
         [DataMember] public double SkyAlt;
+        /// <summary>Motor axis angles (from the step counts), before any backlash correction.</summary>
         [DataMember] public double MountAz;
         [DataMember] public double MountAlt;
         [DataMember] public DateTime TimeUtc;
+
+        // Gear history at the moment of the sync, used to learn backlash.
+        // Play is the engine's estimate of motor-minus-tube angle at the time.
+        // History is the direction (+1/-1) of the last long move, followed by the signed length of every
+        // move since; replaying it through the gear play gives the play for any backlash value.
+        // Null when no long move has happened yet.
+        [DataMember] public double PlayAz;
+        [DataMember] public double PlayAlt;
+        [DataMember] public double[] HistoryAz;
+        [DataMember] public double[] HistoryAlt;
     }
 
     /// <summary>Fitted model terms, radians.</summary>
@@ -37,21 +48,28 @@ namespace NinScan.Core.Pointing
         [DataMember] public double NPAE;
         /// <summary>Tube flexure, proportional to cos(altitude).</summary>
         [DataMember] public double TF;
+        /// <summary>Gear backlash (full play) of the azimuth axis.</summary>
+        [DataMember] public double BacklashAz;
+        /// <summary>Gear backlash (full play) of the altitude axis.</summary>
+        [DataMember] public double BacklashAlt;
 
-        internal const int Count = 7;
+        internal const int Count = 9;
+        internal const int BacklashAzIndex = 7;
+        internal const int BacklashAltIndex = 8;
 
-        internal double[] ToArray() => new[] { IA, IE, TiltN, TiltE, CA, NPAE, TF };
+        internal double[] ToArray() => new[] { IA, IE, TiltN, TiltE, CA, NPAE, TF, BacklashAz, BacklashAlt };
 
         internal static ModelTerms FromArray(double[] p) => new ModelTerms
         {
-            IA = p[0], IE = p[1], TiltN = p[2], TiltE = p[3], CA = p[4], NPAE = p[5], TF = p[6],
+            IA = p[0], IE = p[1], TiltN = p[2], TiltE = p[3], CA = p[4], NPAE = p[5], TF = p[6], BacklashAz = p[7], BacklashAlt = p[8],
         };
 
         public override string ToString()
         {
             string f(double r) => (AstroMath.ToDeg(r) * 3600).ToString("F0") + "\"";
             return "IA " + (AstroMath.ToDeg(IA)).ToString("F3") + "° IE " + (AstroMath.ToDeg(IE)).ToString("F3")
-                + "° tiltN " + f(TiltN) + " tiltE " + f(TiltE) + " CA " + f(CA) + " NPAE " + f(NPAE) + " TF " + f(TF);
+                + "° tiltN " + f(TiltN) + " tiltE " + f(TiltE) + " CA " + f(CA) + " NPAE " + f(NPAE) + " TF " + f(TF)
+                + " backlash az " + f(BacklashAz) + " alt " + f(BacklashAlt);
         }
     }
 
@@ -62,12 +80,30 @@ namespace NinScan.Core.Pointing
     /// usual small terms on top. Terms are switched on as syncs accumulate, so a single sync just fixes
     /// the zero points, two syncs also solve the base tilt, and more points add cone, axis
     /// non-perpendicularity and tube flexure. Every N.I.N.A. plate-solve sync becomes a point.
+    ///
+    /// Backlash is fitted too. A sync records which way each axis last moved; if the sky disagrees
+    /// with the motor count by an amount that flips with the direction of approach, that is gear play.
+    /// The fit needs syncs approached from both directions, and is pulled towards what earlier
+    /// sessions learned so it stays stable.
+    ///
+    /// The model works in "tube" angles: motor angles with the backlash play taken out.
     /// </summary>
     public sealed class PointingModel
     {
         private readonly object _lock = new object();
         private readonly List<SyncPoint> _points = new List<SyncPoint>();
         private ModelTerms _terms = new ModelTerms();
+        private bool _backlashFixed;
+        private readonly double[] _backlashDefault = new double[2];
+        private readonly double[] _backlashPrior = new double[2];
+        private readonly double[] _backlashPriorWeight = new double[2];
+        private readonly int[] _informative = new int[2];
+        private readonly bool[] _backlashFitted = new bool[2];
+
+        /// <summary>A sync only teaches backlash when the axis travelled at least this far before it (radians).</summary>
+        public static readonly double LearningMove = AstroMath.ToRad(1.0);
+        /// <summary>Largest backlash the model will accept (radians).</summary>
+        public static readonly double MaxBacklash = AstroMath.ToRad(0.9);
 
         public int MaxPoints { get; set; } = 40;
         /// <summary>A new sync this close to an existing point replaces it, radians.</summary>
@@ -88,6 +124,62 @@ namespace NinScan.Core.Pointing
 
         public event EventHandler Changed;
 
+        /// <summary>Per-axis RMS fit residual, radians (azimuth as an arc on the sky). 0 until there are spare points.</summary>
+        public double RmsAz { get; private set; }
+        public double RmsAlt { get; private set; }
+
+        /// <summary>Effective backlash per axis (fitted, or the default when it cannot be fitted yet), radians.</summary>
+        public double BacklashAz { get { lock (_lock) return _terms.BacklashAz; } }
+        public double BacklashAlt { get { lock (_lock) return _terms.BacklashAlt; } }
+
+        /// <summary>Whether the backlash of an axis (0 az, 1 alt) was fitted from this model's points.</summary>
+        public bool BacklashFitted(int axis) { lock (_lock) return _backlashFitted[axis]; }
+
+        /// <summary>Number of points that can teach backlash on an axis (0 az, 1 alt).</summary>
+        public int InformativePoints(int axis) { lock (_lock) return _informative[axis]; }
+
+        /// <summary>
+        /// How backlash is handled.
+        /// </summary>
+        /// <param name="fixedValues">True to use <paramref name="defaults"/> as-is and never fit (manual or off).</param>
+        /// <param name="defaults">Backlash used until the points can determine it, radians [az, alt].</param>
+        /// <param name="prior">What earlier sessions learned, radians [az, alt]; the fit is pulled towards it.</param>
+        /// <param name="priorWeight">How many syncs' worth of evidence the prior represents [az, alt].</param>
+        public void ConfigureBacklash(bool fixedValues, double[] defaults, double[] prior, double[] priorWeight)
+        {
+            lock (_lock)
+            {
+                _backlashFixed = fixedValues;
+                for (int i = 0; i < 2; i++)
+                {
+                    _backlashDefault[i] = Clamp(defaults[i], 0, MaxBacklash);
+                    _backlashPrior[i] = Clamp(prior[i], 0, MaxBacklash);
+                    _backlashPriorWeight[i] = Math.Max(0, priorWeight[i]);
+                }
+                FitLocked();
+            }
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Motor-minus-tube angle for a point given a backlash value. When the gear history is known
+        /// (a long move came before), it follows from the backlash; otherwise the engine's estimate is used.
+        /// </summary>
+        public static double PlayOf(double[] history, double storedPlay, double backlash)
+        {
+            if (history == null || history.Length == 0) return storedPlay;
+            double half = backlash / 2;
+            double play = Math.Sign(history[0]) * half;
+            for (int i = 1; i < history.Length; i++) play = Clamp(play + history[i], -half, half);
+            return play;
+        }
+
+        private static double PlayAz(SyncPoint q, double b) => PlayOf(q.HistoryAz, q.PlayAz, b);
+        private static double PlayAlt(SyncPoint q, double b) => PlayOf(q.HistoryAlt, q.PlayAlt, b);
+
+        /// <summary>Tube angles of a sync point using the current backlash.</summary>
+        private AltAz TubeOf(SyncPoint q) => new AltAz(q.MountAz - PlayAz(q, _terms.BacklashAz), q.MountAlt - PlayAlt(q, _terms.BacklashAlt));
+
         public void Clear()
         {
             lock (_lock)
@@ -99,20 +191,27 @@ namespace NinScan.Core.Pointing
             Changed?.Invoke(this, EventArgs.Empty);
         }
 
-        /// <summary>Adds a sync point and refits. Returns a description of what happened, for the log.</summary>
+        /// <summary>Adds a sync point with no gear history and refits.</summary>
         public string AddPoint(AltAz sky, AltAz mount, DateTime utc)
         {
+            return AddPoint(new SyncPoint { SkyAz = sky.Az, SkyAlt = sky.Alt, MountAz = mount.Az, MountAlt = mount.Alt, TimeUtc = utc });
+        }
+
+        /// <summary>Adds a sync point and refits. Returns a description of what happened, for the log.</summary>
+        public string AddPoint(SyncPoint p)
+        {
             string note;
+            var sky = new AltAz(p.SkyAz, p.SkyAlt);
             lock (_lock)
             {
                 note = "";
                 // Only judge a sync against the model once the model can describe the base tilt;
                 // before that an unlevel base alone can put a correct sync degrees away.
-                bool shapeKnown = ActiveTerms(_points.Count, SpreadLocked())[2];
+                bool shapeKnown = ActiveTerms(_points.Count, SpreadLocked(), false, false)[2];
                 if (shapeKnown && _points.Count >= 3 && ResetThreshold > 0)
                 {
                     var predicted = SkyToMountLocked(sky);
-                    double err = Separation(predicted, mount);
+                    double err = Separation(predicted, TubeOf(p));
                     if (err > ResetThreshold)
                     {
                         note = "Sync was " + AstroMath.ToDeg(err).ToString("F2") + "° from the model; assuming the base moved and restarting the model. ";
@@ -120,7 +219,6 @@ namespace NinScan.Core.Pointing
                     }
                 }
 
-                var p = new SyncPoint { SkyAz = sky.Az, SkyAlt = sky.Alt, MountAz = mount.Az, MountAlt = mount.Alt, TimeUtc = utc };
                 int replaced = _points.RemoveAll(q => Separation(new AltAz(q.SkyAz, q.SkyAlt), sky) < ReplaceRadius);
                 if (replaced > 0) note += "Replaced " + replaced + " nearby point(s). ";
                 _points.Add(p);
@@ -251,7 +349,9 @@ namespace NinScan.Core.Pointing
         /// <param name="points">Number of sync points.</param>
         /// <param name="spread">Largest separation between any two points, radians. Points bunched in one patch
         /// of sky cannot tell the shape terms apart, so those stay off until the points are spread out.</param>
-        internal static bool[] ActiveTerms(int points, double spread)
+        /// <param name="backlashAz">The azimuth points include approaches from both directions.</param>
+        /// <param name="backlashAlt">The altitude points include approaches from both directions.</param>
+        internal static bool[] ActiveTerms(int points, double spread, bool backlashAz, bool backlashAlt)
         {
             bool spreadOk = spread >= AstroMath.ToRad(15);
             return new[]
@@ -263,7 +363,32 @@ namespace NinScan.Core.Pointing
                 points >= 4 && spreadOk,    // CA
                 points >= 6 && spreadOk,    // NPAE
                 points >= 8 && spreadOk,    // TF
+                points >= 4 && backlashAz,  // backlash az
+                points >= 4 && backlashAlt, // backlash alt
             };
+        }
+
+        /// <summary>Counts points whose gear history teaches backlash, split by which way the gears were loaded.</summary>
+        private void CountInformative(out bool az, out bool alt)
+        {
+            int azPos = 0, azNeg = 0, altPos = 0, altNeg = 0;
+            double refAz = Math.Max(_terms.BacklashAz, AstroMath.ToRad(0.2));
+            double refAlt = Math.Max(_terms.BacklashAlt, AstroMath.ToRad(0.2));
+            foreach (var q in _points)
+            {
+                if (q.HistoryAz != null && q.HistoryAz.Length > 0)
+                {
+                    if (PlayAz(q, refAz) > 0) azPos++; else azNeg++;
+                }
+                if (q.HistoryAlt != null && q.HistoryAlt.Length > 0)
+                {
+                    if (PlayAlt(q, refAlt) > 0) altPos++; else altNeg++;
+                }
+            }
+            _informative[0] = azPos + azNeg;
+            _informative[1] = altPos + altNeg;
+            az = !_backlashFixed && azPos >= 2 && azNeg >= 2;
+            alt = !_backlashFixed && altPos >= 2 && altNeg >= 2;
         }
 
         private double SpreadLocked()
@@ -278,14 +403,17 @@ namespace NinScan.Core.Pointing
         private void FitLocked()
         {
             int n = _points.Count;
+            _backlashFitted[0] = _backlashFitted[1] = false;
             if (n == 0)
             {
-                _terms = new ModelTerms();
-                RmsError = 0;
+                _terms = new ModelTerms { BacklashAz = _backlashDefault[0], BacklashAlt = _backlashDefault[1] };
+                _informative[0] = _informative[1] = 0;
+                RmsError = RmsAz = RmsAlt = 0;
                 return;
             }
 
-            var active = ActiveTerms(n, SpreadLocked());
+            CountInformative(out bool fitAz, out bool fitAlt);
+            var active = ActiveTerms(n, SpreadLocked(), fitAz, fitAlt);
             var idx = Enumerable.Range(0, ModelTerms.Count).Where(i => active[i]).ToArray();
 
             // Starting point: zero points from the circular mean of the residuals.
@@ -299,6 +427,8 @@ namespace NinScan.Core.Pointing
             var p = new double[ModelTerms.Count];
             p[0] = Math.Atan2(sy, sx);
             p[1] = se / n;
+            p[ModelTerms.BacklashAzIndex] = _backlashDefault[0];
+            p[ModelTerms.BacklashAltIndex] = _backlashDefault[1];
 
             // Levenberg–Marquardt on the residuals, az residuals weighted by cos(alt) so they are true sky angles.
             double lambda = 1e-3;
@@ -363,21 +493,44 @@ namespace NinScan.Core.Pointing
             }
 
             p[0] = AstroMath.WrapPi(p[0]);
+            p[ModelTerms.BacklashAzIndex] = Clamp(p[ModelTerms.BacklashAzIndex], 0, MaxBacklash);
+            p[ModelTerms.BacklashAltIndex] = Clamp(p[ModelTerms.BacklashAltIndex], 0, MaxBacklash);
+            _backlashFitted[0] = active[ModelTerms.BacklashAzIndex];
+            _backlashFitted[1] = active[ModelTerms.BacklashAltIndex];
             _terms = ModelTerms.FromArray(p);
             int dof = 2 * n - idx.Length;
-            RmsError = dof > 0 ? Math.Sqrt(cost / n) : 0;
+            var r = PointResiduals(p);
+            double saz = 0, salt = 0;
+            for (int i = 0; i < n; i++) { saz += r[2 * i] * r[2 * i]; salt += r[2 * i + 1] * r[2 * i + 1]; }
+            RmsError = dof > 0 ? Math.Sqrt((saz + salt) / n) : 0;
+            RmsAz = dof > 0 ? Math.Sqrt(saz / n) : 0;
+            RmsAlt = dof > 0 ? Math.Sqrt(salt / n) : 0;
         }
 
-        private double[] Residuals(double[] p)
+        private double[] PointResiduals(double[] p)
         {
             var r = new double[_points.Count * 2];
             for (int i = 0; i < _points.Count; i++)
             {
                 var q = _points[i];
                 var f = Forward(p, new AltAz(q.SkyAz, q.SkyAlt));
-                r[2 * i] = AstroMath.WrapPi(q.MountAz - f.Az) * Math.Cos(q.SkyAlt);
-                r[2 * i + 1] = q.MountAlt - f.Alt;
+                double tubeAz = q.MountAz - PlayAz(q, p[ModelTerms.BacklashAzIndex]);
+                double tubeAlt = q.MountAlt - PlayAlt(q, p[ModelTerms.BacklashAltIndex]);
+                r[2 * i] = AstroMath.WrapPi(tubeAz - f.Az) * Math.Cos(q.SkyAlt);
+                r[2 * i + 1] = tubeAlt - f.Alt;
             }
+            return r;
+        }
+
+        /// <summary>Point residuals plus the pull of the backlash towards what earlier sessions learned.</summary>
+        private double[] Residuals(double[] p)
+        {
+            var pr = PointResiduals(p);
+            var r = new double[pr.Length + 2];
+            Array.Copy(pr, r, pr.Length);
+            // Each sync constrains half the backlash, so a prior worth w syncs pulls with weight sqrt(w)/2.
+            r[pr.Length] = (p[ModelTerms.BacklashAzIndex] - _backlashPrior[0]) / 2 * Math.Sqrt(_backlashPriorWeight[0]);
+            r[pr.Length + 1] = (p[ModelTerms.BacklashAltIndex] - _backlashPrior[1]) / 2 * Math.Sqrt(_backlashPriorWeight[1]);
             return r;
         }
 
@@ -420,6 +573,8 @@ namespace NinScan.Core.Pointing
             }
             return x;
         }
+
+        private static double Clamp(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
 
         /// <summary>Great-circle separation of two horizontal positions, radians.</summary>
         public static double Separation(AltAz a, AltAz b)

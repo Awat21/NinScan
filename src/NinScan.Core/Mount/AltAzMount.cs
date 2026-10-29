@@ -43,8 +43,14 @@ namespace NinScan.Core.Mount
         private readonly AxisDrive _driveAz = new AxisDrive(Axis.Azimuth);
         private readonly AxisDrive _driveAlt = new AxisDrive(Axis.Altitude);
 
-        private AltAz _mountPos;        // mount axis angles, azimuth unwrapped
+        private AltAz _mountPos;        // tube axis angles (motor angles less gear play), azimuth unwrapped
+        private AltAz _rawPos;          // motor axis angles from the step counts
         private DateTime _posTime;
+        private readonly GearState _gearAz = new GearState();
+        private readonly GearState _gearAlt = new GearState();
+        private LearnedMechanics _mech = new LearnedMechanics();
+        private SyncSnapshot _lastSync;
+        private bool _pushSinceSync;
 
         private bool _tracking;
         private TrackingRateKind _rate = TrackingRateKind.Sidereal;
@@ -70,7 +76,29 @@ namespace NinScan.Core.Mount
             _runBackgroundLoop = runBackgroundLoop;
             _transportFactory = transportFactory;
             Model = new PointingModel();
+            _mech = LearnedMechanics.Load(MechanicsPath);
             ApplyModelSettings();
+        }
+
+        /// <summary>Backlash and clutch-slip knowledge carried across sessions.</summary>
+        public LearnedMechanics Mechanics
+        {
+            get { lock (_sync) return _mech.Clone(); }
+        }
+
+        /// <summary>What the last sync revealed about how the mount really moved, for display.</summary>
+        public string LastSyncReport { get; private set; }
+
+        /// <summary>Forgets learned backlash and slip counts (for example after adjusting the clutches).</summary>
+        public void ResetLearnedMechanics()
+        {
+            lock (_sync)
+            {
+                _mech.Reset();
+                SaveMechanics();
+                ApplyModelSettings();
+                _log.Info("Learned backlash and slip counts reset.");
+            }
         }
 
         public PointingModel Model { get; }
@@ -157,6 +185,12 @@ namespace NinScan.Core.Mount
                         _mc.InitialisationDone();
                         Model.Clear();
                         _atPark = false;
+                        _gearAz.Reset();
+                        _gearAlt.Reset();
+                        _lastSync = null;
+                        _mech.RollSession();
+                        SaveMechanics();
+                        ApplyModelSettings();
                         _log.Info("Mount was just powered on: assuming the tube is at the start position (az "
                             + _settings.StartAzimuthDeg + "°, alt " + _settings.StartAltitudeDeg + "°). Pointing model cleared.");
                         SaveState();
@@ -380,8 +414,27 @@ namespace NinScan.Core.Mount
         {
             int az = _mc.InquirePosition(Axis.Azimuth);
             int alt = _mc.InquirePosition(Axis.Altitude);
-            _mountPos = new AltAz(StepsToAngle(Axis.Azimuth, az), StepsToAngle(Axis.Altitude, alt));
+            _rawPos = new AltAz(StepsToAngle(Axis.Azimuth, az), StepsToAngle(Axis.Altitude, alt));
+            _gearAz.Update(_rawPos.Az, Model.BacklashAz);
+            _gearAlt.Update(_rawPos.Alt, Model.BacklashAlt);
+            _mountPos = new AltAz(_rawPos.Az - _gearAz.Play, _rawPos.Alt - _gearAlt.Play);
             _posTime = _clock.UtcNow;
+        }
+
+        private GearState Gear(Axis axis) => axis == Axis.Azimuth ? _gearAz : _gearAlt;
+
+        private double Backlash(Axis axis) => axis == Axis.Azimuth ? Model.BacklashAz : Model.BacklashAlt;
+
+        /// <summary>
+        /// Motor movement needed for the tube to move by <paramref name="tubeDelta"/>: in a new direction
+        /// the motor first has to take up the gear play.
+        /// </summary>
+        private double MotorDeltaFor(Axis axis, double tubeDelta)
+        {
+            if (tubeDelta == 0) return 0;
+            double half = Backlash(axis) / 2;
+            double target = tubeDelta > 0 ? half : -half;
+            return tubeDelta + (target - Gear(axis).Play);
         }
 
         // ------------------------------------------------------------------ state
@@ -604,8 +657,9 @@ namespace NinScan.Core.Mount
                 m = job.MountTarget;
             }
 
-            GotoAxis(Axis.Azimuth, m.Az);
-            GotoAxis(Axis.Altitude, m.Alt);
+            if (job.Stage == 0) ChooseApproach(job, m);
+            GotoWithApproach(job, Axis.Azimuth, m.Az);
+            GotoWithApproach(job, Axis.Altitude, m.Alt);
             job.Stage++;
             job.StartedUtc = _clock.UtcNow;
             _goto = job;
@@ -624,10 +678,81 @@ namespace NinScan.Core.Mount
             return AstroMath.ToDeg(d) / 3.0 + 3.0;
         }
 
-        private void GotoAxis(Axis axis, double angle)
+        /// <summary>Decides which way each axis makes its final move for this goto.</summary>
+        private void ChooseApproach(GotoJob job, AltAz target)
+        {
+            var mode = _settings.Approach;
+            if (mode == ApproachMode.TrackingDirection && !job.IsRaDec) mode = ApproachMode.UpAndRight;
+            switch (mode)
+            {
+                case ApproachMode.Off:
+                    job.ApproachAz = job.ApproachAlt = 0;
+                    break;
+                case ApproachMode.UpAndRight:
+                    job.ApproachAz = job.ApproachAlt = 1;
+                    break;
+                case ApproachMode.DownAndLeft:
+                    job.ApproachAz = job.ApproachAlt = -1;
+                    break;
+                default:
+                {
+                    // The direction each axis will be moving a minute after arrival.
+                    var arrive = _clock.UtcNow.AddSeconds(EstimateSlewSeconds(target));
+                    var a = TrackedMountAt(arrive);
+                    var b = TrackedMountAt(arrive.AddSeconds(60));
+                    double tiny = AstroMath.ToRad(1.0 / 3600);
+                    job.ApproachAz = double.IsNaN(a.Az) || double.IsNaN(b.Az) || Math.Abs(b.Az - a.Az) < tiny ? 1 : Math.Sign(b.Az - a.Az);
+                    job.ApproachAlt = Math.Abs(b.Alt - a.Alt) < tiny ? 1 : Math.Sign(b.Alt - a.Alt);
+                    break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Starts the goto on one axis. If the final move would come from the wrong side, it first stops
+        /// short on the far side and the second leg (issued when the axes stop) comes in the right way.
+        /// </summary>
+        private void GotoWithApproach(GotoJob job, Axis axis, double tubeTarget)
+        {
+            int approach = axis == Axis.Azimuth ? job.ApproachAz : job.ApproachAlt;
+            double now = axis == Axis.Azimuth ? _mountPos.Az : _mountPos.Alt;
+            double delta = tubeTarget - now;
+            double overshoot = Math.Max(AstroMath.ToRad(_settings.MinApproachOvershootDeg), 2 * Backlash(axis));
+            SetPending(job, axis, false);
+
+            if (approach != 0 && Math.Abs(delta) > AstroMath.ToRad(0.5 / 3600) && Math.Sign(delta) != approach)
+            {
+                double first = tubeTarget - approach * overshoot;
+                if (WithinTravel(axis, first))
+                {
+                    GotoAxis(axis, first);
+                    SetPending(job, axis, true);
+                    return;
+                }
+            }
+            GotoAxis(axis, tubeTarget);
+        }
+
+        private static void SetPending(GotoJob job, Axis axis, bool pending)
+        {
+            if (axis == Axis.Azimuth) job.PendingAz = pending; else job.PendingAlt = pending;
+        }
+
+        private bool WithinTravel(Axis axis, double tubeAngle)
+        {
+            double deg = AstroMath.ToDeg(tubeAngle);
+            if (axis == Axis.Altitude) return deg >= _settings.MinAltitudeDeg && deg <= _settings.MaxAltitudeDeg;
+            double fromStart = deg - _settings.StartAzimuthDeg;
+            return Math.Abs(fromStart) <= _settings.AzimuthTravelDeg;
+        }
+
+        /// <summary>Moves an axis so the tube (not just the motor) ends at <paramref name="tubeAngle"/>.</summary>
+        private void GotoAxis(Axis axis, double tubeAngle)
         {
             var drive = Drive(axis);
-            int target = AngleToSteps(axis, angle);
+            double tubeNow = axis == Axis.Azimuth ? _mountPos.Az : _mountPos.Alt;
+            double rawNow = axis == Axis.Azimuth ? _rawPos.Az : _rawPos.Alt;
+            int target = AngleToSteps(axis, rawNow + MotorDeltaFor(axis, tubeAngle - tubeNow));
             int current = _mc.InquirePosition(axis);
             int delta = target - current;
             StopAndWait(drive, force: true);
@@ -752,13 +877,121 @@ namespace NinScan.Core.Mount
 
         private void AddSync(AltAz apparent, DateTime now)
         {
-            var mount = new AltAz(AstroMath.Wrap2Pi(_mountPos.Az), _mountPos.Alt);
             var before = ApparentFromMount(_mountPos);
-            string note = Model.AddPoint(apparent, mount, now);
+            var point = new SyncPoint
+            {
+                SkyAz = apparent.Az, SkyAlt = apparent.Alt,
+                MountAz = AstroMath.Wrap2Pi(_rawPos.Az), MountAlt = _rawPos.Alt, TimeUtc = now,
+                PlayAz = _gearAz.Play, PlayAlt = _gearAlt.Play,
+                HistoryAz = _gearAz.History(), HistoryAlt = _gearAlt.History(),
+            };
+
+            string motion = AnalyseMotionSinceLastSync(apparent, now);
+            string note = Model.AddPoint(point);
             _log.Info("Sync to " + apparent + " (mount said " + before + ", off by "
                 + (AstroMath.ToDeg(PointingModel.Separation(before, apparent)) * 60).ToString("F1") + "′). " + note);
+            if (motion != null) _log.Info(motion);
+
+            _lastSync = new SyncSnapshot
+            {
+                Sky = apparent, RawAz = _rawPos.Az, RawAlt = _rawPos.Alt, PlayAz = _gearAz.Play, PlayAlt = _gearAlt.Play,
+                HistoryAz = _gearAz.History(), HistoryAlt = _gearAlt.History(), Utc = now,
+            };
+            _pushSinceSync = false;
+            LearnFromModel(now);
             SaveState();
         }
+
+        /// <summary>
+        /// Compares how far the motors moved since the previous sync with how far the plate solves say the
+        /// tube moved. Gear play explains some of the difference; anything left over means the tube did not
+        /// follow the motors (a slipping clutch or a stall) and is reported.
+        /// </summary>
+        private string AnalyseMotionSinceLastSync(AltAz apparent, DateTime now)
+        {
+            var last = _lastSync;
+            if (last == null || _pushSinceSync || Model.PointCount == 0 || (now - last.Utc).TotalMinutes > 30) return null;
+
+            var oPrev = Model.SkyToMount(last.Sky);
+            var oNow = Model.SkyToMount(apparent);
+            double measuredAz = AstroMath.WrapPi(oNow.Az - oPrev.Az);
+            double measuredAlt = oNow.Alt - oPrev.Alt;
+            double motorAz = _rawPos.Az - last.RawAz;
+            double motorAlt = _rawPos.Alt - last.RawAlt;
+            double expectedAz = motorAz - (_gearAz.Play - last.PlayAz);
+            double expectedAlt = motorAlt - (_gearAlt.Play - last.PlayAlt);
+            double lostAz = (expectedAz - measuredAz) * Math.Cos(apparent.Alt);
+            double lostAlt = expectedAlt - measuredAlt;
+
+            string Fmt(double r) => (AstroMath.ToDeg(r) * 60).ToString("+0.0;-0.0") + "′";
+            var report = "Since the last sync: azimuth motors " + Fmt(motorAz) + ", tube " + Fmt(measuredAz)
+                + "; altitude motors " + Fmt(motorAlt) + ", tube " + Fmt(measuredAlt) + ".";
+
+            var warnings = new List<string>();
+            CheckLostMotion(0, "azimuth", lostAz, SameLoading(last.HistoryAz, _gearAz.History()), Model.RmsAz, warnings);
+            CheckLostMotion(1, "altitude", lostAlt, SameLoading(last.HistoryAlt, _gearAlt.History()), Model.RmsAlt, warnings);
+            if (warnings.Count > 0)
+            {
+                report += " " + string.Join(" ", warnings);
+                _log.Warn(string.Join(" ", warnings));
+                SaveMechanics();
+            }
+            LastSyncReport = report;
+            return report;
+        }
+
+        /// <summary>
+        /// True when the gears were loaded the same way at both syncs whatever the backlash is, so backlash
+        /// cannot account for any difference between motor and tube movement.
+        /// </summary>
+        private static bool SameLoading(double[] before, double[] after)
+        {
+            if (before == null || after == null) return false;
+            foreach (double deg in new[] { 0.2, 0.5, PointingModel.MaxBacklash * 180 / Math.PI })
+            {
+                double b = AstroMath.ToRad(deg);
+                if (Math.Abs(PointingModel.PlayOf(before, 0, b) - PointingModel.PlayOf(after, 0, b)) > AstroMath.ToRad(1.0 / 3600)) return false;
+            }
+            return true;
+        }
+
+        private void CheckLostMotion(int axis, string name, double lost, bool sameLoading, double rms, List<string> warnings)
+        {
+            double threshold = Math.Max(AstroMath.ToRad(3.0 / 60), 3 * rms);
+            if (Math.Abs(lost) <= threshold) return;
+            string amount = (AstroMath.ToDeg(Math.Abs(lost)) * 60).ToString("F1") + "′";
+            string motors = "The " + name + " motors moved " + amount + (lost > 0 ? " more" : " less") + " than the tube did";
+            bool backlashKnown = Model.BacklashFitted(axis) || _settings.Backlash != BacklashMode.Learn;
+            if (!sameLoading && !backlashKnown)
+            {
+                // The gears changed direction and the backlash is not pinned down yet: could be either.
+                warnings.Add(motors + " after a change of direction. That is probably backlash still being learned; if it keeps happening, check the clutch.");
+                return;
+            }
+            _mech.SlipEvents[axis]++;
+            warnings.Add(motors + (sameLoading ? ", with the gears loaded the same way both times, so it is not backlash" : ", more than the learned backlash explains")
+                + ": the clutch may be slipping or the tube is out of balance (" + _mech.SlipEvents[axis] + " time(s) so far).");
+        }
+
+        /// <summary>Folds the model's backlash fit into what is remembered across sessions.</summary>
+        private void LearnFromModel(DateTime now)
+        {
+            if (_settings.Backlash != BacklashMode.Learn) return;
+            bool changed = false;
+            for (int i = 0; i < 2; i++)
+            {
+                if (!Model.BacklashFitted(i)) continue;
+                double b = i == 0 ? Model.BacklashAz : Model.BacklashAlt;
+                _mech.SetSession(i, b, Model.InformativePoints(i), now);
+                changed = true;
+            }
+            if (!changed) return;
+            SaveMechanics();
+            _log.Info("Learned backlash: azimuth " + Arcmin(_mech.Effective(0)) + " (" + _mech.TotalWeight(0) + " syncs), altitude "
+                + Arcmin(_mech.Effective(1)) + " (" + _mech.TotalWeight(1) + " syncs).");
+        }
+
+        private static string Arcmin(double rad) => (AstroMath.ToDeg(rad) * 60).ToString("F1") + "′";
 
         public void ClearModel()
         {
@@ -847,6 +1080,15 @@ namespace NinScan.Core.Mount
             _driveAz.Running = false;
             _driveAlt.Running = false;
 
+            if (job.PendingAz || job.PendingAlt)
+            {
+                // Second leg: come in from the approach side.
+                var t = job.IsRaDec ? TrackedMountAt(_clock.UtcNow.AddSeconds(2)) : job.MountTarget;
+                if (job.PendingAz) { job.PendingAz = false; if (!double.IsNaN(t.Az)) GotoAxis(Axis.Azimuth, t.Az); }
+                if (job.PendingAlt) { job.PendingAlt = false; GotoAxis(Axis.Altitude, t.Alt); }
+                return;
+            }
+
             if (job.IsRaDec)
             {
                 var m = TrackedMountAt(_clock.UtcNow);
@@ -907,7 +1149,9 @@ namespace NinScan.Core.Mount
             {
                 _log.Info("Tube moved " + AstroMath.ToDeg(AngularError(t0, _mountPos)).ToString("F2")
                     + "° without being told to (pushed by hand?); tracking from the new position.");
+                _pushSinceSync = true;
                 CaptureTrackTarget();
+                t0 = TrackedMountAt(now);
                 t1 = TrackedMountAt(now.AddSeconds(lead));
             }
 
@@ -924,9 +1168,35 @@ namespace NinScan.Core.Mount
                 return;
             }
 
-            ApplyRate(Axis.Azimuth, (t1.Az - _mountPos.Az) / lead);
-            ApplyRate(Axis.Altitude, (t1.Alt - _mountPos.Alt) / lead);
+            ApplyRate(Axis.Azimuth, TrackingMotorRate(Axis.Azimuth, t1.Az - t0.Az, t0.Az - _mountPos.Az, lead));
+            ApplyRate(Axis.Altitude, TrackingMotorRate(Axis.Altitude, t1.Alt - t0.Alt, t0.Alt - _mountPos.Alt, lead));
             _trackTicks++;
+        }
+
+        /// <summary>Share of the position error corrected per cycle. Below 1 so the loop cannot overshoot and ring.</summary>
+        private const double TrackingGain = 0.6;
+
+        /// <summary>
+        /// Fastest correction on top of the target's own motion, radians per second. Kept below the speed
+        /// where the board needs to accelerate, so corrections take effect at once.
+        /// </summary>
+        private static readonly double MaxCorrectionRate = AstroMath.ToRad(0.2);
+
+        /// <summary>
+        /// Motor rate for one tracking cycle: the target's own motion plus part of the remaining error.
+        /// When the axis has to reverse, the gear play is taken up quickly instead of the tube stalling for
+        /// minutes. Tiny reversals are ignored so the gears are not rattled back and forth at a turning point.
+        /// </summary>
+        private double TrackingMotorRate(Axis axis, double targetMotion, double error, double lead)
+        {
+            double tubeDelta = targetMotion + TrackingGain * error;
+            var gear = Gear(axis);
+            double half = Backlash(axis) / 2;
+            bool loadedThatWay = half <= 0 || (tubeDelta * gear.Play > 0 && Math.Abs(gear.Play) >= half - 1e-9);
+            if (!loadedThatWay && Math.Abs(tubeDelta) < AstroMath.ToRad(2.0 / 3600)) return 0;
+            double rate = MotorDeltaFor(axis, tubeDelta) / lead;
+            double limit = Math.Abs(targetMotion / lead) + MaxCorrectionRate;
+            return Math.Max(-limit, Math.Min(limit, rate));
         }
 
         /// <summary>Sets an axis running at a signed rate in radians per second of axis angle.</summary>
@@ -1017,18 +1287,40 @@ namespace NinScan.Core.Mount
         private void ApplyModelSettings()
         {
             Model.ResetThreshold = AstroMath.ToRad(_settings.ModelResetThresholdDeg);
+            switch (_settings.Backlash)
+            {
+                case BacklashMode.Off:
+                    Model.ConfigureBacklash(true, new double[2], new double[2], new double[2]);
+                    break;
+                case BacklashMode.Manual:
+                    var manual = new[] { AstroMath.ToRad(_settings.ManualBacklashAzArcmin / 60), AstroMath.ToRad(_settings.ManualBacklashAltArcmin / 60) };
+                    Model.ConfigureBacklash(true, manual, manual, new double[2]);
+                    break;
+                default:
+                    Model.ConfigureBacklash(false, new[] { _mech.Effective(0), _mech.Effective(1) },
+                        (double[])_mech.PriorBacklash.Clone(), (double[])_mech.PriorWeight.Clone());
+                    break;
+            }
         }
 
         // ------------------------------------------------------------------ persistence
 
         private string StatePath => _stateDirectory == null ? null : Path.Combine(_stateDirectory, "state.json");
 
+        private string MechanicsPath => _stateDirectory == null ? null : Path.Combine(_stateDirectory, "learned.json");
+
+        private void SaveMechanics()
+        {
+            try { _mech.Save(MechanicsPath); }
+            catch (Exception ex) { _log.Warn("Could not save learned mechanics: " + ex.Message); }
+        }
+
         private void SaveState()
         {
             if (StatePath == null) return;
             try
             {
-                var s = new SessionState { AtPark = _atPark, Points = new List<SyncPoint>(Model.Points) };
+                var s = new SessionState { AtPark = _atPark, Points = new List<SyncPoint>(Model.Points), GearAz = _gearAz, GearAlt = _gearAlt };
                 Directory.CreateDirectory(_stateDirectory);
                 using (var fs = File.Create(StatePath))
                 {
@@ -1053,6 +1345,8 @@ namespace NinScan.Core.Mount
                 }
                 _atPark = s.AtPark;
                 Model.ReplacePoints(s.Points ?? new List<SyncPoint>());
+                _gearAz.CopyFrom(s.GearAz);
+                _gearAlt.CopyFrom(s.GearAlt);
             }
             catch (Exception ex)
             {
@@ -1065,6 +1359,103 @@ namespace NinScan.Core.Mount
         {
             [DataMember] public bool AtPark;
             [DataMember] public List<SyncPoint> Points;
+            [DataMember] public GearState GearAz;
+            [DataMember] public GearState GearAlt;
+        }
+
+        /// <summary>
+        /// Tracks the gear play of one axis from the motor movements. Play is motor angle minus tube angle,
+        /// between -backlash/2 and +backlash/2: moving one way pushes it to one end, and the tube only moves
+        /// once it gets there.
+        /// </summary>
+        [DataContract]
+        internal sealed class GearState
+        {
+            private const int MaxHistory = 64;
+
+            [DataMember] public double Play;
+            [DataMember] public double LastRaw;
+            [DataMember] public bool Initialised;
+            /// <summary>Direction of the last move longer than <see cref="PointingModel.LearningMove"/>, 0 if none yet.</summary>
+            [DataMember] public int Anchor;
+            /// <summary>Signed lengths of the moves since the anchor (the last one still in progress).</summary>
+            [DataMember] public List<double> Segments = new List<double>();
+            /// <summary>Number of direction changes, so a sync can tell whether the axis reversed since the last one.</summary>
+            [DataMember] public int Reversals;
+
+            public int Dir => Segments.Count > 0 ? Math.Sign(Segments[Segments.Count - 1]) : Anchor;
+
+            public void Reset()
+            {
+                Play = 0; Initialised = false; Anchor = 0; Segments = new List<double>(); Reversals = 0;
+            }
+
+            public void CopyFrom(GearState g)
+            {
+                if (g == null) return;
+                Play = g.Play; LastRaw = g.LastRaw; Initialised = g.Initialised; Anchor = g.Anchor;
+                Segments = new List<double>(g.Segments ?? new List<double>()); Reversals = g.Reversals;
+            }
+
+            /// <summary>The history to store with a sync: anchor direction then the moves since. Null without an anchor.</summary>
+            public double[] History()
+            {
+                if (Anchor == 0) return null;
+                var h = new double[Segments.Count + 1];
+                h[0] = Anchor;
+                Segments.CopyTo(h, 1);
+                return h;
+            }
+
+            public void Update(double raw, double backlash)
+            {
+                double half = backlash / 2;
+                if (Segments == null) Segments = new List<double>();
+                if (!Initialised)
+                {
+                    LastRaw = raw;
+                    Initialised = true;
+                    Play = Math.Max(-half, Math.Min(half, Play));
+                    return;
+                }
+                double delta = raw - LastRaw;
+                LastRaw = raw;
+                Play = Math.Max(-half, Math.Min(half, Play + delta));
+                if (delta == 0) return;
+
+                int last = Segments.Count - 1;
+                if (last >= 0 && Math.Sign(Segments[last]) == Math.Sign(delta))
+                {
+                    Segments[last] += delta;
+                }
+                else
+                {
+                    if (last >= 0) Reversals++;
+                    Segments.Add(delta);
+                }
+
+                // A long move fully loads the gears one way: it becomes the new anchor.
+                last = Segments.Count - 1;
+                if (Math.Abs(Segments[last]) >= PointingModel.LearningMove)
+                {
+                    Anchor = Math.Sign(Segments[last]);
+                    Segments.Clear();
+                }
+                else if (Segments.Count > MaxHistory)
+                {
+                    // Too much wandering to replay; forget the anchor until the next long move.
+                    Anchor = 0;
+                    Segments.RemoveRange(0, Segments.Count - MaxHistory);
+                }
+            }
+        }
+
+        private sealed class SyncSnapshot
+        {
+            public AltAz Sky;
+            public double RawAz, RawAlt, PlayAz, PlayAlt;
+            public double[] HistoryAz, HistoryAlt;
+            public DateTime Utc;
         }
 
         private sealed class AxisDrive
@@ -1085,6 +1476,10 @@ namespace NinScan.Core.Mount
             public AltAz MountTarget;
             public int Stage;
             public DateTime StartedUtc;
+            /// <summary>Final-move direction per axis (+1, -1, or 0 for straight in).</summary>
+            public int ApproachAz, ApproachAlt;
+            /// <summary>The axis stopped short on the far side and still needs its final approach leg.</summary>
+            public bool PendingAz, PendingAlt;
             /// <summary>Motors have arrived; tracking is pulling in the last few arcseconds.</summary>
             public bool Settling;
             public DateTime SettleStartedUtc;

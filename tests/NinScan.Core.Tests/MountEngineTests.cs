@@ -95,13 +95,15 @@ namespace NinScan.Core.Tests
             Assert.True(m.Tracking);
             Assert.True(SepArcsec(m.Equatorial, star) < 30, "arrived " + SepArcsec(m.Equatorial, star) + "″ off");
 
+            // "Arrived" means within the 20″ goto tolerance; tracking pulls in the rest within a few seconds.
+            Run(m, 10);
             double worst = 0;
             for (int i = 0; i < 1200; i++)
             {
                 Run(m, 0.5);
                 worst = Math.Max(worst, SepArcsec(m.Equatorial, star));
             }
-            Assert.True(worst < 5, "tracking error reached " + worst + "″");
+            Assert.True(worst < 2, "tracking error reached " + worst + "″");
             Assert.True(m.Tracking);
         }
 

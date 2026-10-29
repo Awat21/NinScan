@@ -13,16 +13,19 @@ NinScan does that work itself:
 - **Coordinate conversion**: RA/Dec ↔ alt/az for your site and time, with atmospheric refraction.
 - **Tracking**: an alt-az mount has to change both axis speeds all the time. NinScan recalculates them twice a second and corrects any drift.
 - **Pointing model**: every sync, including N.I.N.A.'s plate-solve syncs, adds a point. The model solves for an unlevel base exactly. As points build up it adds cone error, axis non-perpendicularity and tube flexure, so gotos improve the longer you image.
+- **Backlash learning**: each sync records which way the gears were last loaded. When plate solves disagree with the motor counts by an amount that flips with direction, that's gear play. NinScan learns it per axis, remembers it across power cycles, and compensates on gotos and tracking reversals.
+- **Slip detection**: between two syncs, NinScan compares how far the motors turned with how far the plate solves say the tube moved. If they differ and backlash can't explain it, it logs a likely clutch slip. That covers "the app showed it moving but it didn't".
+- **Goto approach direction**: gotos finish with a short move from a set side so the gears are always loaded the same way. The default is the direction tracking will continue, so tracking starts without slack. SynScan-style up-and-right is an option.
 - **Safety**: altitude limits, an azimuth travel limit (so cables don't wind up), and motors stopped when the last program disconnects.
 - **Hand-push detection**: if you push the tube while it's tracking, NinScan carries on tracking from the new spot instead of fighting you back. This relies on Freedom Find keeping the count.
 
 ## Status
 
-**v0.1, not yet tested on real hardware.** Everything works against the built-in simulator and has 40 automated tests. The next step is first light on the 250P: see [docs/INSTALL.md](docs/INSTALL.md).
+**v0.1, not yet tested on real hardware.** Everything works against the built-in simulator, including gear backlash and clutch slip, and has 46 automated tests. The next step is first light on the 250P: see [docs/INSTALL.md](docs/INSTALL.md).
 
 | Version | Scope |
 |---|---|
-| v1 (this) | Connect, goto, tracking (sidereal, lunar, solar), sync and pointing model, park, manual moves, limits, Freedom Find, simulator |
+| v1 (this) | Connect, goto, tracking (sidereal, lunar, solar), sync and pointing model, backlash learning and compensation, slip detection, goto approach direction, park, manual moves, limits, Freedom Find, simulator |
 | v1.1 | Field derotation with the Wanderer Astro Rotator Mini V2 (the maths is already in `AstroMath.FieldRotationRate`) |
 | v2 | Pulse guiding (PHD2) on alt-az: guide pulses converted using the current sky angle at the target |
 
