@@ -100,6 +100,12 @@ namespace NinScan.Core.Mount
         /// <summary>Smallest overshoot before the final approach move, degrees. It grows to twice the backlash when that is larger.</summary>
         [DataMember] public double MinApproachOvershootDeg = 1.0;
 
+        /// <summary>
+        /// While solar viewing is off, the telescope is kept at least this far from the Sun (degrees).
+        /// Solar viewing itself is not a stored setting: it is switched on per connection, after confirming a filter is fitted.
+        /// </summary>
+        [DataMember] public double SunAvoidanceDeg = 15;
+
         /// <summary>Reported to clients only. Defaults are the Flextube 250P.</summary>
         [DataMember] public double ApertureMm = 254;
         [DataMember] public double FocalLengthMm = 1200;
@@ -144,6 +150,7 @@ namespace NinScan.Core.Mount
             if (MaxMoveRateDegPerSec <= 0) throw new ArgumentException("Maximum move rate must be positive.");
             if (ManualBacklashAzArcmin < 0 || ManualBacklashAltArcmin < 0 || ManualBacklashAzArcmin > 54 || ManualBacklashAltArcmin > 54)
                 throw new ArgumentException("Manual backlash must be between 0 and 54 arcminutes.");
+            if (SunAvoidanceDeg < 5 || SunAvoidanceDeg > 45) throw new ArgumentException("Sun avoidance must be 5–45 degrees.");
             if (MinApproachOvershootDeg < 0 || MinApproachOvershootDeg > 5) throw new ArgumentException("Approach overshoot must be 0–5 degrees.");
         }
     }

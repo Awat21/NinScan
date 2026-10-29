@@ -51,6 +51,7 @@ namespace NinScan.Core.Mount
         private LearnedMechanics _mech = new LearnedMechanics();
         private SyncSnapshot _lastSync;
         private bool _pushSinceSync;
+        private bool _solarViewing;
 
         private bool _tracking;
         private TrackingRateKind _rate = TrackingRateKind.Sidereal;
@@ -205,6 +206,7 @@ namespace NinScan.Core.Mount
                     _tracking = false;
                     _goto = null;
                     _moving[1] = _moving[2] = false;
+                    _solarViewing = false;
                     ReadPosition();
                     LastError = null;
                 }
@@ -546,13 +548,15 @@ namespace NinScan.Core.Mount
                 var apparent = ApparentFromRaDec(target, now);
                 var m = MountFromApparent(apparent, _mountPos.Az);
                 CheckReachable(m, apparent);
+                CheckSunTarget(apparent);
+                var route = PlanRoute(_mountPos, m);
 
                 CancelManualMoves();
                 _trackTarget = new RaDec(AstroMath.Wrap24(target.RaHours), target.DecDeg);
                 _trackEpoch = now;
                 _tracking = true;
                 _trackTicks = 0;
-                var job = new GotoJob { IsRaDec = true, TrackAfter = true, Description = target.ToString() };
+                var job = new GotoJob { IsRaDec = true, TrackAfter = true, Description = target.ToString(), Waypoints = route };
                 _log.Info("Goto " + target + " (apparent " + apparent + ", mount " + m + ").");
                 IssueGoto(job, refine: false);
             }
@@ -567,9 +571,11 @@ namespace NinScan.Core.Mount
                 RequireUnparked();
                 var m = MountFromApparent(apparent, _mountPos.Az);
                 CheckReachable(m, apparent);
+                CheckSunTarget(apparent);
+                var route = PlanRoute(_mountPos, m);
                 CancelManualMoves();
                 _tracking = false;
-                var job = new GotoJob { IsRaDec = false, MountTarget = m, Description = apparent.ToString() };
+                var job = new GotoJob { IsRaDec = false, MountTarget = m, Description = apparent.ToString(), Waypoints = route };
                 _log.Info("Goto " + apparent + " (mount " + m + ").");
                 IssueGoto(job, refine: false);
             }
@@ -585,7 +591,8 @@ namespace NinScan.Core.Mount
                 _tracking = false;
                 double az = AstroMath.ToRad(_settings.ParkAzimuthDeg);
                 double alt = AstroMath.ToRad(_settings.ParkAltitudeDeg);
-                var job = new GotoJob { IsRaDec = false, Park = true, MountTarget = new AltAz(az, alt), Description = "park" };
+                var route = PlanRoute(_mountPos, new AltAz(az, alt));
+                var job = new GotoJob { IsRaDec = false, Park = true, MountTarget = new AltAz(az, alt), Description = "park", Waypoints = route };
                 _log.Info("Parking at mount az " + _settings.ParkAzimuthDeg + "°, alt " + _settings.ParkAltitudeDeg + "°.");
                 IssueGoto(job, refine: false);
             }
@@ -642,6 +649,18 @@ namespace NinScan.Core.Mount
         private void IssueGoto(GotoJob job, bool refine)
         {
             ReadPosition();
+            if (job.Stage == 0 && job.Waypoints != null && job.Waypoints.Count > 0)
+            {
+                // Detour around the Sun: visit each waypoint before heading for the target.
+                var w = job.Waypoints.Dequeue();
+                _log.Info("Detouring via mount az " + AstroMath.ToDeg(w.Az).ToString("F1") + "°, alt " + AstroMath.ToDeg(w.Alt).ToString("F1") + "° to keep clear of the Sun.");
+                GotoAxis(Axis.Azimuth, w.Az);
+                GotoAxis(Axis.Altitude, w.Alt);
+                job.StartedUtc = _clock.UtcNow;
+                job.StartSunSeparationDeg = SunSeparationDeg(_mountPos);
+                _goto = job;
+                return;
+            }
             AltAz m;
             if (job.IsRaDec)
             {
@@ -662,6 +681,7 @@ namespace NinScan.Core.Mount
             GotoWithApproach(job, Axis.Altitude, m.Alt);
             job.Stage++;
             job.StartedUtc = _clock.UtcNow;
+            job.StartSunSeparationDeg = SunSeparationDeg(_mountPos);
             _goto = job;
             if (refine) _log.Debug("Refining goto, stage " + job.Stage + ".");
         }
@@ -784,6 +804,127 @@ namespace NinScan.Core.Mount
                     + _settings.MinAltitudeDeg + "° to " + _settings.MaxAltitudeDeg + "°).");
         }
 
+        // ------------------------------------------------------------------ Sun safety
+
+        /// <summary>
+        /// Solar viewing: when off (the default at every connect), the telescope is kept away from the Sun.
+        /// Only switch on with a proper solar filter over the front of the telescope and the finder capped.
+        /// </summary>
+        public bool SolarViewing
+        {
+            get { lock (_sync) return _solarViewing; }
+            set
+            {
+                lock (_sync)
+                {
+                    if (_solarViewing == value) return;
+                    _solarViewing = value;
+                    if (value) _log.Warn("Solar viewing switched ON: the telescope may now point at the Sun. A solar filter must be fitted.");
+                    else _log.Info("Solar viewing switched off: keeping " + _settings.SunAvoidanceDeg + "° from the Sun.");
+                }
+            }
+        }
+
+        /// <summary>Apparent position of the Sun now.</summary>
+        public AltAz SunPosition => ApparentFromRaDec(AstroMath.SunPosition(_clock.UtcNow), _clock.UtcNow);
+
+        /// <summary>True between sunrise and sunset at the configured site.</summary>
+        public bool IsSunUp => AstroMath.ToDeg(SunPosition.Alt) > -0.833;
+
+        /// <summary>The Sun is up and solar viewing is off: the moment to ask whether solar viewing is intended.</summary>
+        public bool ShouldOfferSolarViewing
+        {
+            get { lock (_sync) return !_solarViewing && IsSunUp; }
+        }
+
+        private double SunSeparationDeg(AltAz tube)
+        {
+            return AstroMath.ToDeg(PointingModel.Separation(ApparentFromMount(tube), SunPosition));
+        }
+
+        /// <summary>Within <paramref name="fraction"/> of the avoidance radius of the Sun, with solar viewing off and the Sun not well below the horizon.</summary>
+        private bool SunTooClose(AltAz tube, double fraction)
+        {
+            if (_solarViewing) return false;
+            var sun = SunPosition;
+            if (AstroMath.ToDeg(sun.Alt) < -_settings.SunAvoidanceDeg) return false;
+            return AstroMath.ToDeg(PointingModel.Separation(ApparentFromMount(tube), sun)) < _settings.SunAvoidanceDeg * fraction;
+        }
+
+        private void CheckSunTarget(AltAz apparent)
+        {
+            if (_solarViewing) return;
+            var sun = SunPosition;
+            if (AstroMath.ToDeg(sun.Alt) < -_settings.SunAvoidanceDeg) return;
+            double sep = AstroMath.ToDeg(PointingModel.Separation(apparent, sun));
+            if (sep < _settings.SunAvoidanceDeg)
+                throw new InvalidOperationException("That target is " + sep.ToString("F1") + "° from the Sun. Solar viewing is off, so NinScan keeps "
+                    + _settings.SunAvoidanceDeg + "° away. Turn solar viewing on (with a solar filter fitted) to point there.");
+        }
+
+        private bool MovesTowardSun(Axis axis, double rate)
+        {
+            if (!SunTooClose(_mountPos, 1.0)) return false;
+            var ahead = _mountPos;
+            double step = AstroMath.ToRad(0.5) * Math.Sign(rate);
+            if (axis == Axis.Azimuth) ahead.Az += step; else ahead.Alt += step;
+            return SunSeparationDeg(ahead) < SunSeparationDeg(_mountPos);
+        }
+
+        /// <summary>
+        /// Checks the path a goto would take (both axes moving at the same speed) and finds a detour if it
+        /// would pass the Sun: altitude first, azimuth first, or round underneath or over the top.
+        /// Returns the waypoints to visit, empty when the direct path is clear.
+        /// </summary>
+        private Queue<AltAz> PlanRoute(AltAz from, AltAz to)
+        {
+            var none = new Queue<AltAz>();
+            if (_solarViewing || AstroMath.ToDeg(SunPosition.Alt) < -_settings.SunAvoidanceDeg) return none;
+            if (PathClear(from, to)) return none;
+
+            double low = AstroMath.ToRad(_settings.MinAltitudeDeg + 2);
+            double high = AstroMath.ToRad(_settings.MaxAltitudeDeg - 2);
+            var options = new[]
+            {
+                new[] { new AltAz(from.Az, to.Alt) },
+                new[] { new AltAz(to.Az, from.Alt) },
+                new[] { new AltAz(from.Az, low), new AltAz(to.Az, low) },
+                new[] { new AltAz(from.Az, high), new AltAz(to.Az, high) },
+            };
+            foreach (var option in options)
+            {
+                var prev = from;
+                bool ok = true;
+                foreach (var w in option)
+                {
+                    if (!PathClear(prev, w)) { ok = false; break; }
+                    prev = w;
+                }
+                if (ok && PathClear(prev, to)) return new Queue<AltAz>(option);
+            }
+            throw new InvalidOperationException("Could not find a path to that target that stays " + _settings.SunAvoidanceDeg
+                + "° from the Sun. Solar viewing is off.");
+        }
+
+        /// <summary>
+        /// True if the path never comes within the avoidance radius of the Sun. A path that starts inside the
+        /// radius (solar viewing was just switched off) only fails if it gets closer still, so it can always leave.
+        /// </summary>
+        private bool PathClear(AltAz from, AltAz to)
+        {
+            double startSep = SunSeparationDeg(from);
+            double dAz = to.Az - from.Az, dAlt = to.Alt - from.Alt;
+            double longest = Math.Max(Math.Abs(dAz), Math.Abs(dAlt));
+            int n = Math.Max(10, (int)(AstroMath.ToDeg(longest) * 2));
+            for (int i = 0; i <= n; i++)
+            {
+                double s = longest * i / n;
+                var p = new AltAz(from.Az + Math.Sign(dAz) * Math.Min(s, Math.Abs(dAz)), from.Alt + Math.Sign(dAlt) * Math.Min(s, Math.Abs(dAlt)));
+                if (SunTooClose(p, 1.0) && SunSeparationDeg(p) < startSep - 0.01) return false;
+            }
+            return true;
+        }
+
         // ------------------------------------------------------------------ manual moves
 
         /// <summary>Moves an axis continuously at a rate in degrees per second (0 stops). Positive is increasing angle.</summary>
@@ -821,6 +962,9 @@ namespace NinScan.Core.Mount
 
                 ReadPosition();
                 if (WouldPassLimit(axis, degPerSec)) throw new InvalidOperationException("That direction is blocked by the " + axis + " limit.");
+                if (MovesTowardSun(axis, degPerSec))
+                    throw new InvalidOperationException("That direction is blocked: the telescope is within " + _settings.SunAvoidanceDeg
+                        + "° of the Sun and solar viewing is off.");
                 _moving[i] = true;
                 ApplyRate(axis, AstroMath.ToRad(degPerSec));
             }
@@ -1067,6 +1211,16 @@ namespace NinScan.Core.Mount
             var sAlt = _mc.InquireStatus(Axis.Altitude);
             if (sAz.Running || sAlt.Running)
             {
+                if (SunTooClose(_mountPos, 0.6) && SunSeparationDeg(_mountPos) < job.StartSunSeparationDeg - 1)
+                {
+                    _log.Error("Goto to " + job.Description + " came within " + SunSeparationDeg(_mountPos).ToString("F1") + "° of the Sun; stopped.");
+                    _goto = null;
+                    _tracking = false;
+                    StopAndWait(_driveAz, force: true);
+                    StopAndWait(_driveAlt, force: true);
+                    LastError = "Stopped: the telescope came too close to the Sun.";
+                    return;
+                }
                 if ((_clock.UtcNow - job.StartedUtc).TotalSeconds > 300)
                 {
                     _log.Error("Goto to " + job.Description + " took over 5 minutes; stopping.");
@@ -1079,6 +1233,13 @@ namespace NinScan.Core.Mount
             }
             _driveAz.Running = false;
             _driveAlt.Running = false;
+
+            if (job.Stage == 0)
+            {
+                // Reached a detour waypoint: on to the next one, or the target.
+                IssueGoto(job, refine: false);
+                return;
+            }
 
             if (job.PendingAz || job.PendingAlt)
             {
@@ -1134,6 +1295,13 @@ namespace NinScan.Core.Mount
                     _moving[(int)axis] = false;
                     StopAndWait(drive, force: true);
                 }
+                else if (MovesTowardSun(axis, rate))
+                {
+                    _log.Warn("Manual move stopped " + SunSeparationDeg(_mountPos).ToString("F1") + "° from the Sun (solar viewing is off).");
+                    LastError = "Manual move stopped near the Sun.";
+                    _moving[(int)axis] = false;
+                    StopAndWait(drive, force: true);
+                }
             }
         }
 
@@ -1156,6 +1324,15 @@ namespace NinScan.Core.Mount
             }
 
             double altDeg = AstroMath.ToDeg(t1.Alt);
+            if (!double.IsNaN(t1.Az) && SunTooClose(t1, 1.0))
+            {
+                _tracking = false;
+                StopAndWait(_driveAz, force: true);
+                StopAndWait(_driveAlt, force: true);
+                LastError = "Tracking stopped: the target came within " + _settings.SunAvoidanceDeg + "° of the Sun and solar viewing is off.";
+                _log.Warn(LastError);
+                return;
+            }
             if (double.IsNaN(t1.Az) || altDeg < _settings.MinAltitudeDeg || altDeg > _settings.MaxAltitudeDeg)
             {
                 _tracking = false;
@@ -1480,6 +1657,10 @@ namespace NinScan.Core.Mount
             public int ApproachAz, ApproachAlt;
             /// <summary>The axis stopped short on the far side and still needs its final approach leg.</summary>
             public bool PendingAz, PendingAlt;
+            /// <summary>Detour points (tube angles) to visit before the target, to keep clear of the Sun.</summary>
+            public Queue<AltAz> Waypoints;
+            /// <summary>Distance from the Sun when the current leg started, degrees.</summary>
+            public double StartSunSeparationDeg;
             /// <summary>Motors have arrived; tracking is pulling in the last few arcseconds.</summary>
             public bool Settling;
             public DateTime SettleStartedUtc;

@@ -81,6 +81,26 @@ The engine aims where the target will be when the slew ends. One fast goto, and 
 
 **Tracking loop stability.** Each cycle the loop corrects 60% of the remaining error on top of the target's own motion. Corrections are capped at 0.2°/s. The board changes speed instantly at those rates, so the loop can't overshoot and ring. In testing, correcting the full error each cycle became unstable once backlash take-up was added.
 
+## Sun safety
+
+The Sun's position comes from the Astronomical Almanac's low-precision formulae, accurate to about 0.01°. With solar viewing off, the following checks apply whenever the Sun is less than the avoidance radius below the horizon:
+
+- **Goto targets** inside the avoidance radius (default 15°) are refused, with a message saying why.
+- **Goto paths** are sampled assuming both axes move at the same speed. If the direct path passes the Sun, the engine tries, in order:
+  1. altitude first, then azimuth;
+  2. azimuth first, then altitude;
+  3. down low and across;
+  4. up high and across.
+
+  It uses the first clear route as waypoints, or refuses the goto if none is clear.
+- **While slewing**, a goto that gets within 60% of the radius and closer than it started is stopped. This is a safety net in case the path assumption is wrong on the real mount.
+- **Manual moves** stop at the edge of the zone, and can't start towards the Sun from inside it.
+- **Tracking** stops if the target comes within the radius.
+
+All of these only block moves that get *closer* to the Sun. If solar viewing is switched off while pointing at the Sun, you can still slew away or park.
+
+Solar viewing is a per-connection flag, never saved. When the driver connects, or a client sets the site latitude or longitude, and the Sun is up, a non-blocking window asks whether solar viewing is intended. Clients can also use the `NinScan:SolarViewing` action with `on` or `off`.
+
 ## Session memory
 
 The motor board keeps counting as long as it's powered, so NinScan stores the pointing model, gear state and park state in `%LOCALAPPDATA%\NinScan\state.json`. On connect, the board's "initialised" flag tells a fresh power-on (start from the start position, clear the model) from a reconnect (restore both).

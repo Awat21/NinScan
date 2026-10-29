@@ -56,8 +56,15 @@ namespace NinScan.Driver
             {
                 Guard("Connected=" + value, () =>
                 {
-                    if (value) SharedMount.Connect(_client);
-                    else SharedMount.Disconnect(_client);
+                    if (value)
+                    {
+                        SharedMount.Connect(_client);
+                        SolarPrompt.ShowIfNeeded();
+                    }
+                    else
+                    {
+                        SharedMount.Disconnect(_client);
+                    }
                 });
             }
         }
@@ -73,7 +80,7 @@ namespace NinScan.Driver
             using (var f = new SetupForm()) f.ShowDialog();
         }
 
-        public ArrayList SupportedActions => new ArrayList { "NinScan:ModelInfo", "NinScan:ClearModel", "NinScan:Status", "NinScan:Mechanics" };
+        public ArrayList SupportedActions => new ArrayList { "NinScan:ModelInfo", "NinScan:ClearModel", "NinScan:Status", "NinScan:Mechanics", "NinScan:SolarViewing" };
 
         public string Action(string actionName, string actionParameters)
         {
@@ -91,6 +98,14 @@ namespace NinScan.Driver
                         + (AstroMath.ToDeg(m.Effective(1)) * 60).ToString("F1") + "′ (" + m.TotalWeight(1) + " syncs); slips az " + m.SlipEvents[0]
                         + ", alt " + m.SlipEvents[1] + (Engine.LastSyncReport != null ? "; last sync: " + Engine.LastSyncReport : "");
                 }
+                case "ninscan:solarviewing":
+                    // Parameter "on" or "off" changes it; anything else just reports.
+                    switch ((actionParameters ?? "").Trim().ToLowerInvariant())
+                    {
+                        case "on": Engine.SolarViewing = true; break;
+                        case "off": Engine.SolarViewing = false; break;
+                    }
+                    return Engine.SolarViewing ? "on" : "off";
                 case "ninscan:status":
                     return Engine.Connected
                         ? "mount " + Engine.MountPosition + "; sky " + Engine.SkyPosition + "; tracking " + Engine.Tracking + "; slewing " + Engine.Slewing
@@ -242,6 +257,7 @@ namespace NinScan.Driver
             {
                 if (value < -90 || value > 90) throw new ASCOM.InvalidValueException("SiteLatitude", value.ToString(), "-90 to 90");
                 UpdateSettings(s => s.LatitudeDeg = value);
+                SolarPrompt.ShowIfNeeded();
             }
         }
 
@@ -252,6 +268,7 @@ namespace NinScan.Driver
             {
                 if (value < -180 || value > 180) throw new ASCOM.InvalidValueException("SiteLongitude", value.ToString(), "-180 to 180");
                 UpdateSettings(s => s.LongitudeDeg = value);
+                SolarPrompt.ShowIfNeeded();
             }
         }
 

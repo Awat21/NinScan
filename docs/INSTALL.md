@@ -18,6 +18,16 @@
 
 To remove the driver, run `Unregister.cmd`.
 
+## Daylight testing and solar viewing
+
+If you connect while the Sun is up, NinScan asks whether solar viewing is intended:
+- **No:** it keeps the scope at least 15° from the Sun. Gotos near the Sun are refused, and gotos across it take a detour.
+- **Yes:** only with a proper filter over the front of the tube and the finder capped. You can then goto the Sun; set the tracking rate to Solar.
+
+Solar viewing turns itself off the next time NinScan connects. The settings window also has a toggle, under "Sun safety".
+
+For daylight tests of the motors themselves, cap the tube and the finder anyway. Until the first sync, NinScan's idea of where it's pointing is only as good as your start position.
+
 ## First light, step by step
 
 These checks confirm the parts the simulator can't: motor directions, speeds and the Freedom Find behaviour. Logs are in `%LOCALAPPDATA%\NinScan\logs`; the settings window has a button that opens the folder. For the first sessions, tick "Log every serial command".

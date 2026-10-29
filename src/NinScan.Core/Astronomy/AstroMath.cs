@@ -161,6 +161,22 @@ namespace NinScan.Core.Astronomy
         }
 
         /// <summary>
+        /// Apparent position of the Sun, good to about 0.01° (the Astronomical Almanac's low-precision formulae).
+        /// Plenty for keeping a telescope away from it.
+        /// </summary>
+        public static RaDec SunPosition(DateTime utc)
+        {
+            double n = JulianDate(utc) - 2451545.0;
+            double l = 280.460 + 0.9856474 * n;
+            double g = ToRad(357.528 + 0.9856003 * n);
+            double lambda = ToRad(l + 1.915 * Math.Sin(g) + 0.020 * Math.Sin(2 * g));
+            double eps = ToRad(23.439 - 0.0000004 * n);
+            double ra = Math.Atan2(Math.Cos(eps) * Math.Sin(lambda), Math.Cos(lambda));
+            double dec = Math.Asin(Math.Sin(eps) * Math.Sin(lambda));
+            return new RaDec(Wrap24(ToDeg(ra) / 15.0), ToDeg(dec));
+        }
+
+        /// <summary>
         /// Rate of field rotation for an alt-az mount, radians per second.
         /// Kept here for the derotation work planned for v1.1.
         /// </summary>

@@ -36,6 +36,9 @@ namespace NinScan.Driver
         private readonly ComboBox _approach = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
         private readonly TextBox _overshoot = Num();
         private readonly Label _learned = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
+        private readonly CheckBox _solar = new CheckBox { Text = "Solar viewing ON (solar filter fitted)", AutoSize = true };
+        private readonly TextBox _sunAvoid = Num();
+        private readonly Label _sunInfo = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
         private readonly CheckBox _debug = new CheckBox { Text = "Log every serial command (for troubleshooting)", AutoSize = true };
         private readonly Label _modelInfo = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
         private readonly Label _status = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
@@ -82,6 +85,12 @@ namespace NinScan.Driver
             Row(grid, "Hand-push detection (°, 0 = off)", _manual);
             Row(grid, "Restart model if a sync is off by (°)", _resetModel);
             Row(grid, "Aperture / focal length (mm)", Flow(_aperture, _focal));
+
+            Heading(grid, "Sun safety");
+            Row(grid, "Keep away from the Sun by (°)", _sunAvoid);
+            _solar.Click += (s, e) => ToggleSolar();
+            Row(grid, "", _solar);
+            Row(grid, "", _sunInfo);
 
             Heading(grid, "Backlash and approach");
             _backlash.Items.AddRange(new object[] { "Learn from syncs", "Manual", "Off" });
@@ -155,6 +164,8 @@ namespace NinScan.Driver
             _manualAlt.Text = F(_settings.ManualBacklashAltArcmin);
             _approach.SelectedIndex = (int)_settings.Approach;
             _overshoot.Text = F(_settings.MinApproachOvershootDeg);
+            _sunAvoid.Text = F(_settings.SunAvoidanceDeg);
+            ShowSolar();
             ShowModel();
             ShowLearned();
             var e = SharedMount.Engine;
@@ -179,6 +190,34 @@ namespace NinScan.Driver
                 ? "No sync points yet. Each plate-solve sync adds one."
                 : m.PointCount + " sync point(s)" + (m.RmsError > 0 ? ", fit " + (AstroMath.ToDeg(m.RmsError) * 3600).ToString("F0") + "″ rms" : "")
                     + "\n" + m.Terms;
+        }
+
+        private void ShowSolar()
+        {
+            var e = SharedMount.Engine;
+            _solar.Enabled = e.Connected;
+            _solar.Checked = e.Connected && e.SolarViewing;
+            double sunAlt = AstroMath.ToDeg(e.SunPosition.Alt);
+            _sunInfo.Text = (sunAlt > -0.833 ? "The Sun is up (" + sunAlt.ToString("F0") + "°). " : "The Sun is down. ")
+                + (e.Connected ? "" : "Solar viewing can be switched on while connected. ")
+                + "Solar viewing always starts off when NinScan connects.";
+        }
+
+        private void ToggleSolar()
+        {
+            var e = SharedMount.Engine;
+            if (_solar.Checked)
+            {
+                var answer = MessageBox.Show(this, "Allow the telescope to point at the Sun?\n\nOnly continue if a proper solar filter is fitted securely over the front of the telescope and the finder is capped or filtered.",
+                    "NinScan: solar viewing", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (answer != DialogResult.Yes)
+                {
+                    _solar.Checked = false;
+                    return;
+                }
+            }
+            e.SolarViewing = _solar.Checked;
+            ShowSolar();
         }
 
         private void ShowLearned()
@@ -222,6 +261,7 @@ namespace NinScan.Driver
                 s.ManualBacklashAltArcmin = P(_manualAlt, "manual altitude backlash");
                 s.Approach = (ApproachMode)Math.Max(0, _approach.SelectedIndex);
                 s.MinApproachOvershootDeg = P(_overshoot, "approach overshoot");
+                s.SunAvoidanceDeg = P(_sunAvoid, "Sun avoidance");
                 if (string.IsNullOrEmpty(s.ComPort)) throw new ArgumentException("Choose a COM port, or SIMULATOR.");
                 SharedMount.SaveSettings(s);
                 DialogResult = DialogResult.OK;
